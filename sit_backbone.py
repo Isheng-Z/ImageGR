@@ -1,9 +1,9 @@
-# sit_backbone.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from einops import rearrange
-from config import Config
+import warnings  # [新增] 用于屏蔽警告
 
 
 def modulate(x, shift, scale):
@@ -11,10 +11,6 @@ def modulate(x, shift, scale):
 
 
 class TimestepEmbedder(nn.Module):
-    """
-    对时间 t 进行正弦位置编码嵌入
-    """
-
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -42,18 +38,15 @@ class TimestepEmbedder(nn.Module):
 
 
 class SiTBlock(nn.Module):
-    """
-    Transformer Block (DiT Style) with AdaLN-Zero
-    Windows 兼容版：使用标准 Attention
-    """
-
     def __init__(self, hidden_size, num_heads):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim ** -0.5
+
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-
-        # 使用标准 PyTorch Attention (兼容性好)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
+        self.proj = nn.Linear(hidden_size, hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
@@ -66,19 +59,31 @@ class SiTBlock(nn.Module):
         )
 
     def forward(self, x, c):
-        # x: [B, Num_Patches, Dim]
-        # c: [B, Dim] (Condition)
+        B, N, C = x.shape
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
 
-        # Self-Attention
+        # Attention
         x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
-        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + gate_msa.unsqueeze(1) * x_attn
+
+        # QKV Calculation
+        qkv = self.qkv(x_norm)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # [修复] 显式抑制 "UserWarning: 1Torch was not compiled with flash attention"
+        # 并且优先尝试使用 memory_efficient_attention (Windows上通常可用且很快)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*not compiled with flash attention.*")
+            # 这里的逻辑是：PyTorch 会自动尝试 Flash -> MemEfficient -> Math
+            # 我们只是屏蔽掉它告诉你"Flash不可用"的废话
+            x_attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=self.scale)
+
+        x_attn = x_attn.transpose(1, 2).reshape(B, N, C)
+        x = x + gate_msa.unsqueeze(1) * self.proj(x_attn)
 
         # MLP
         x_norm = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x_mlp = self.mlp(x_norm)
-        x = x + gate_mlp.unsqueeze(1) * x_mlp
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
         return x
 
 
@@ -89,28 +94,21 @@ class SiT_Backbone(nn.Module):
         self.patch_size = patch_size
         self.hidden_size = hidden_size
 
-        # Patch Embedding
         self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
-
-        # Condition Embeddings
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = nn.Embedding(num_classes, hidden_size, padding_idx=None)
 
-        # Positional Embedding
         num_patches = (img_size // patch_size) ** 2
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        # Blocks
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads) for _ in range(depth)
         ])
 
-        # Final Layer
         self.final_layer = nn.Sequential(
             nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
             nn.Linear(hidden_size, patch_size * patch_size * in_channels, bias=True)
         )
-
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -122,7 +120,6 @@ class SiT_Backbone(nn.Module):
 
         self.apply(_basic_init)
 
-        # Initialize adaLN zero linear layers
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
@@ -137,21 +134,14 @@ class SiT_Backbone(nn.Module):
         return imgs
 
     def forward(self, x, t, y):
-        # x: [B, C, H, W] -> Patch Embed -> [B, N, D]
         x = self.x_embedder(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
         x = x + self.pos_embed
-
-        # Process conditions
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
-
-        # Transformer
         for block in self.blocks:
             x = block(x, c)
-
-        # Unpatchify
         x = self.final_layer(x)
         x = self.unpatchify(x)
         return x
